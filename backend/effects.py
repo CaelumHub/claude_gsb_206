@@ -23,7 +23,7 @@ Every effect is self-implemented from first principles:
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 from . import audio_io, dsp
 
@@ -261,17 +261,14 @@ class Chorus:
 
 
 class Reverse:
-    """Buffer the whole signal and reverse it (preview / in-memory only)."""
+    """Reverse the whole signal.
 
-    def __init__(self):
-        self.buf: List[float] = []
-
-    def process_block(self, block: Sequence[float]) -> List[float]:
-        self.buf.extend(block)
-        return []
-
-    def finish(self) -> List[float]:
-        return list(reversed(self.buf))
+    Reversal is non-causal — it needs the entire signal before it can emit a
+    single sample — so it cannot run inside a streaming ``process_block``
+    pipeline.  This class is only a marker: ``EffectChain`` splits the chain
+    into segments at each ``Reverse`` and handles the reversal itself in
+    ``process_full`` (see there).
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -339,7 +336,16 @@ class EffectChain:
         self.sr = sr
         self.effects = [make_effect(s, sr) for s in self.specs]
 
+    @property
+    def has_reverse(self) -> bool:
+        return any(isinstance(fx, Reverse) for fx in self.effects)
+
     def process_block(self, block: Sequence[float]) -> List[float]:
+        if self.has_reverse:
+            raise RuntimeError(
+                "chain contains a Reverse effect, which is non-causal and "
+                "cannot be streamed — use process_full() instead"
+            )
         out = list(block)
         for fx in self.effects:
             out = fx.process_block(out)
@@ -348,11 +354,28 @@ class EffectChain:
     def process_channels(self, channels: Sequence[Sequence[float]]) -> List[List[float]]:
         return [self.process_block(ch) for ch in channels]
 
-    def finish_reverse(self) -> Optional[List[float]]:
+    def process_full(self, channels: Sequence[Sequence[float]]) -> List[List[float]]:
+        """Process a complete in-memory signal, honouring Reverse effects.
+
+        The chain is split into segments at each ``Reverse`` marker; every
+        segment runs as an ordinary effect sub-chain and the signal is
+        reversed between segments.  ``[eq, reverse, compressor]`` therefore
+        yields ``compressor(reverse(eq(x)))`` — each effect sees the output
+        of the previous one, whatever the order.
+        """
+        segments: List[List] = [[]]
         for fx in self.effects:
             if isinstance(fx, Reverse):
-                return fx.finish()
-        return None
+                segments.append([])
+            else:
+                segments[-1].append(fx)
+        out = [list(ch) for ch in channels]
+        for i, seg in enumerate(segments):
+            if i > 0:
+                out = [ch[::-1] for ch in out]
+            for fx in seg:
+                out = [fx.process_block(ch) for ch in out]
+        return out
 
 
 def apply_chain_to_file(src_path: str, dst_path: str, specs: List[Dict]) -> Dict:
@@ -360,17 +383,18 @@ def apply_chain_to_file(src_path: str, dst_path: str, specs: List[Dict]) -> Dict
     with audio_io.WavReader(src_path) as r:
         sr = r.sr
         chain = EffectChain(specs, sr)
-        reversed_bufs: List[Optional[List[float]]] = None
-        has_reverse = any(e.get("type") == "reverse" and e.get("enabled", True) for e in specs)
 
-        if has_reverse:
-            # Reverse must buffer the entire signal — handled specially.
+        if chain.has_reverse:
+            # Reverse is non-causal: it must see the whole signal, so buffer
+            # the file and run the chain in segments (fx… -> reverse -> fx…)
+            # instead of streaming chunk by chunk.
             bufs: List[List[float]] = [[] for _ in range(r.channels)]
             for chunk in r.iter_chunks():
                 for c, ch in enumerate(chunk):
                     bufs[c].extend(ch)
+            out = chain.process_full(bufs)
             with audio_io.WavWriter(dst_path, sr, r.channels, 2) as w:
-                w.write_chunk([bufs[c][::-1] for c in range(r.channels)])
+                w.write_chunk(out)
             return {"frames": r.nframes, "reversed": True}
 
         with audio_io.WavWriter(dst_path, sr, r.channels, 2) as w:
@@ -393,10 +417,9 @@ def render_preview(src_path: str, specs: List[Dict], start_s: float = 0.0,
         if chunk is None:
             chunk = [[0.0]]
         chain = EffectChain(specs, sr)
-        out_ch = chain.process_channels(chunk)
-        rev = chain.finish_reverse()
-        if rev is not None:
-            out_ch = [rev]
+        # The excerpt is fully in memory, so process_full handles chains with
+        # and without Reverse uniformly (and keeps every channel).
+        out_ch = chain.process_full(chunk)
 
     # Encode the preview to a 16-bit WAV in memory.
     import io
